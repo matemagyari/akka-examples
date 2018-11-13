@@ -6,7 +6,6 @@ import akka.actor.ActorSystem
 import akka.pattern.CircuitBreaker
 import com.typesafe.scalalogging.StrictLogging
 import org.scalatest.concurrent.ScalaFutures
-import org.scalatest.exceptions.TestFailedException
 import org.scalatest.{FlatSpec, Matchers}
 
 import scala.concurrent.Future
@@ -18,73 +17,89 @@ class CircuitBreakerTest extends FlatSpec with Matchers with ScalaFutures with S
   implicit val system: ActorSystem = ActorSystem("CircuitBreakerTest")
   import system.dispatcher
 
-  val responseAsFailure: Try[Int] ⇒ Boolean = {
+  sealed trait Response
+  object Response {
+    case object Success extends Response
+    case object SomeError extends Response
+  }
+
+  //which responses should be interpreted as failures for the circuit breaker
+  private val responseAsFailure: Try[Int] ⇒ Boolean = {
     case Success(n) ⇒ n == 500
     case Failure(_) ⇒ true
   }
 
-  def wrap[T](
+  //wrap the : => Future[T] body in a circuit breaker
+  private def wrap[T](
       breaker: CircuitBreaker,
-      f: ⇒ Future[T],
-      responseAsFailure: Try[T] ⇒ Boolean): Future[T] =
-    breaker.withCircuitBreaker(f, responseAsFailure)
+      responseAsFailure: Try[T] ⇒ Boolean,
+      fallbackResponse: T)(f: ⇒ Future[T]): Future[T] =
+    breaker.withCircuitBreaker(f, responseAsFailure).recover {
+      case _: akka.pattern.CircuitBreakerOpenException ⇒ fallbackResponse
+    }
 
-  "Circuitbreaker" should "open if max failure threshold is reached" in {
+  "Circuit breaker" should "open if max failure threshold is reached" in {
 
     val circuitBreaker: CircuitBreaker = newCircuitBreaker(maxFailures = 5)
 
-    val httpCaller = new HttpCaller
+    val fallbackResponse = 9
 
-    def wrappedRemoteCall(i: Int): Future[Int] =
-      wrap(circuitBreaker, httpCaller.call(i), responseAsFailure)
+    val client = new HttpClient
 
-    httpCaller.call(0).futureValue shouldBe 200
-    httpCaller.call(1).futureValue shouldBe 500
-    httpCaller.call(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3
+    def wrappedCall(i: Int): Future[Int] =
+      wrap(circuitBreaker, responseAsFailure, fallbackResponse = fallbackResponse) {
+        client.call(i)
+      }
 
-    httpCaller.count() shouldBe 3
+    client.call(0).futureValue shouldBe 200
+    client.call(1).futureValue shouldBe 500
+    client.call(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3
+
+    client.callsExecuted() shouldBe 3
 
     //let's fail 2 times
 
-    wrappedRemoteCall(0).futureValue shouldBe 200
-    wrappedRemoteCall(1).futureValue shouldBe 500
-    wrappedRemoteCall(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3
+    wrappedCall(0).futureValue shouldBe 200
+    wrappedCall(1).futureValue shouldBe 500
+    wrappedCall(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3
 
-    httpCaller.count() shouldBe 6
+    client.callsExecuted() shouldBe 6
 
     //twice failed already, let's fail 3 more times to reach threshold
     (1 to 3).foreach { _ ⇒
       circuitBreaker.isClosed shouldBe true
-      wrappedRemoteCall(1).futureValue shouldBe 500
+      wrappedCall(1).futureValue shouldBe 500
     }
 
     //CircuitBreaker is open now
     circuitBreaker.isClosed shouldBe false
-    httpCaller.count() shouldBe 9
+    client.callsExecuted() shouldBe 9
 
-    //subsequent calls should not be executed
+    //subsequent calls should not be executed, circuit breaker should respond with the fallback response
     (1 to 3).foreach { _ ⇒
-      try {
-        wrappedRemoteCall(0).futureValue
-        fail("Should have thrown exception")
-      } catch {
-        case ex: TestFailedException
-            if ex.getCause().isInstanceOf[akka.pattern.CircuitBreakerOpenException] ⇒ //ok
-        case ex ⇒ fail(ex)
-      }
-
-      httpCaller.count() shouldBe 9
+      circuitBreaker.isClosed shouldBe false
+      wrappedCall(0).futureValue shouldBe fallbackResponse
+      client.callsExecuted() shouldBe 9
     }
   }
 
-  private def newCircuitBreaker(maxFailures: Int) =
+  private def newCircuitBreaker(name: String = "defaultCB", maxFailures: Int) =
     new CircuitBreaker(
       system.scheduler,
       maxFailures = maxFailures,
       callTimeout = 5 millis,
-      resetTimeout = 10 millis)
+      resetTimeout = 1000 millis)
+      .onOpen {
+        logger.info(s"Circuit breaker [$name] is open")
+      }
+      .onHalfOpen {
+        logger.info(s"Circuit breaker [$name] is half open")
+      }
+      .onClose {
+        logger.info(s"Circuit breaker [$name] closed")
+      }
 
-  private class HttpCaller {
+  private class HttpClient {
 
     private val counter = new AtomicInteger()
 
@@ -98,7 +113,7 @@ class CircuitBreakerTest extends FlatSpec with Matchers with ScalaFutures with S
       }
     }
 
-    def count() = counter.get()
+    def callsExecuted() = counter.get()
   }
 
 }
