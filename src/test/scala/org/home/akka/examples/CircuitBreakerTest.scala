@@ -19,11 +19,19 @@ class CircuitBreakerTest extends FlatSpec with Matchers with ScalaFutures with S
 
   //which responses should be interpreted as failures for the circuit breaker
   private val responseAsFailure: Try[Int] ⇒ Boolean = {
-    case Success(n) ⇒ n >= 500
+    case Success(n) ⇒ n >= 500 //any code equal or greater than 500 should be regarded as a failure
     case Failure(_) ⇒ true
   }
 
-  //wrap the : => Future[T] body in a circuit breaker
+  /**
+    * Wraps the : => Future[T] body in a circuit breaker
+    * @param breaker the Circuit breaker instance
+    * @param responseAsFailure function to define what should be considered failure and thus increase failure count
+    * @param fallbackResponse the response to return if the circuit breaker is open
+    * @param f the body to wrap
+    * @tparam T
+    * @return
+    */
   private def wrap[T](
       breaker: CircuitBreaker,
       responseAsFailure: Try[T] ⇒ Boolean,
@@ -48,23 +56,23 @@ class CircuitBreakerTest extends FlatSpec with Matchers with ScalaFutures with S
       }
 
     //test the unwrapped calls
-    client.call(0).futureValue shouldBe 200
-    client.call(1).futureValue shouldBe 500
-    client.call(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3
+    client.call(0).futureValue shouldBe 200 //success
+    client.call(1).futureValue shouldBe 500 //server failure
+    client.call(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3 //some other failure
 
     client.callsExecuted() shouldBe 3
 
     //let's fail 2 times with the circuit breaker
-    wrappedCall(0).futureValue shouldBe 200
-    wrappedCall(1).futureValue shouldBe 500
-    wrappedCall(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3
+    wrappedCall(0).futureValue shouldBe 200 //success
+    wrappedCall(1).futureValue shouldBe 500 //server failure
+    wrappedCall(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3 //some other failure
 
     client.callsExecuted() shouldBe 6
 
     //twice failed already, let's fail 3 more times to reach threshold
     (1 to 3).foreach { _ ⇒
       circuitBreaker.isClosed shouldBe true
-      wrappedCall(1).futureValue shouldBe 500
+      wrappedCall(1).futureValue shouldBe 500 //server failure
     }
 
     //CircuitBreaker is open now
