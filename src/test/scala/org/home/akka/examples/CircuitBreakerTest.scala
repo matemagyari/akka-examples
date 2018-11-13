@@ -17,15 +17,9 @@ class CircuitBreakerTest extends FlatSpec with Matchers with ScalaFutures with S
   implicit val system: ActorSystem = ActorSystem("CircuitBreakerTest")
   import system.dispatcher
 
-  sealed trait Response
-  object Response {
-    case object Success extends Response
-    case object SomeError extends Response
-  }
-
   //which responses should be interpreted as failures for the circuit breaker
   private val responseAsFailure: Try[Int] ⇒ Boolean = {
-    case Success(n) ⇒ n == 500
+    case Success(n) ⇒ n >= 500
     case Failure(_) ⇒ true
   }
 
@@ -35,30 +29,32 @@ class CircuitBreakerTest extends FlatSpec with Matchers with ScalaFutures with S
       responseAsFailure: Try[T] ⇒ Boolean,
       fallbackResponse: T)(f: ⇒ Future[T]): Future[T] =
     breaker.withCircuitBreaker(f, responseAsFailure).recover {
-      case _: akka.pattern.CircuitBreakerOpenException ⇒ fallbackResponse
+      case _: akka.pattern.CircuitBreakerOpenException ⇒
+        logger.info(s"Circuit breaker is open, returning fallback response")
+        fallbackResponse
     }
 
   "Circuit breaker" should "open if max failure threshold is reached" in {
 
     val circuitBreaker: CircuitBreaker = newCircuitBreaker(maxFailures = 5)
 
-    val fallbackResponse = 9
+    val fallbackResponse = 202
 
     val client = new HttpClient
 
-    def wrappedCall(i: Int): Future[Int] =
+    def wrappedCall(request: Int): Future[Int] =
       wrap(circuitBreaker, responseAsFailure, fallbackResponse = fallbackResponse) {
-        client.call(i)
+        client.call(request)
       }
 
+    //test the unwrapped calls
     client.call(0).futureValue shouldBe 200
     client.call(1).futureValue shouldBe 500
     client.call(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3
 
     client.callsExecuted() shouldBe 3
 
-    //let's fail 2 times
-
+    //let's fail 2 times with the circuit breaker
     wrappedCall(0).futureValue shouldBe 200
     wrappedCall(1).futureValue shouldBe 500
     wrappedCall(2).recover { case _ ⇒ 3 }.futureValue shouldBe 3
@@ -88,7 +84,7 @@ class CircuitBreakerTest extends FlatSpec with Matchers with ScalaFutures with S
       system.scheduler,
       maxFailures = maxFailures,
       callTimeout = 5 millis,
-      resetTimeout = 1000 millis)
+      resetTimeout = 5000 millis)
       .onOpen {
         logger.info(s"Circuit breaker [$name] is open")
       }
@@ -103,9 +99,8 @@ class CircuitBreakerTest extends FlatSpec with Matchers with ScalaFutures with S
 
     private val counter = new AtomicInteger()
 
-    def call(input: Int, delay: FiniteDuration = 0 millis): Future[Int] = {
+    def call(input: Int): Future[Int] = {
       counter.incrementAndGet()
-      Thread.sleep(delay.toMillis)
       (input % 3) match {
         case 0 ⇒ Future.successful(200) //success
         case 1 ⇒ Future.successful(500) //failure
